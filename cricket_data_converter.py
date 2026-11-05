@@ -636,7 +636,7 @@ def standardize_delivery_record(row: Dict[str, Any], idx: int) -> Dict[str, Any]
 
     # Derived Commentary Shot Extraction (Kept strictly separate from verified Hawkeye tracking)
     shot_type_derived = row.get("shotType_derived")
-    shot_type_source = row.get("shotType_source") or "None"
+    shot_type_source = row.get("shotType_source") or None
     if not shot_type_derived and not shot_type and (raw_comm or title):
         full_text = f"{title} {raw_comm}".lower()
         for p_pat, p_lbl in [
@@ -1298,12 +1298,19 @@ def build_field_availability_audit(
     df: pd.DataFrame,
     summary_data: Optional[Dict[str, Any]] = None,
     provider_source: str = "ESPN Public Site API",
+    ball_data_source: Optional[str] = None,
+    fallback_reason: Optional[str] = None,
 ) -> pd.DataFrame:
     """
     Granular Field-Level Data Availability System.
     Replaces blanket source-unavailable messages with a per-field audit table
     verifying field name, availability status, genuine source, valid/missing counts,
     extraction method, and exact technical reason for any missing fields.
+
+    ball_data_source is the feed that actually served the deliveries (see
+    CricketDataProvider.get_ball_commentary_with_provenance); when given, empty
+    tracking fields are explained by that fact rather than by a presumed HTTP 403.
+    fallback_reason is the recorded reason for a fallback, if one happened.
     """
     total_rows = len(df)
 
@@ -1374,6 +1381,17 @@ def build_field_availability_audit(
             elif valid > 0:
                 status = "Partially Available"
                 error_details = f"Partially captured: {valid}/{total_rows} deliveries populated ({round(valid/total_rows*100, 1)}%)."
+            elif ball_data_source and ball_data_source.startswith("ESPNcricinfo"):
+                status = "Not Available from Source"
+                error_details = "Cricinfo commentary feed carried no value for this field on any delivery of this match."
+            elif ball_data_source:
+                status = "Not Retrieved (Fallback Feed)"
+                src = f"{ball_data_source} (no ball tracking)"
+                error_details = (
+                    f"Deliveries were served by {ball_data_source}, which excludes per-ball tracking. "
+                    + (f"Reason: {fallback_reason} " if fallback_reason else "")
+                    + "Re-download with Data Provider set to Auto or ESPNcricinfo Consumer API to populate this field."
+                )
             else:
                 status = "Provider Access Denied"
                 src = "ESPNcricinfo hs-consumer-api (HTTP 403 Forbidden)"

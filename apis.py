@@ -28,6 +28,16 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
+# Names reported back to the UI so it can say exactly where ball data came from.
+PROVIDER_CRICINFO = "ESPNcricinfo Consumer API"
+PROVIDER_PUBLIC = "ESPN Public Site API"
+PROVIDER_PUBLIC_FALLBACK = "ESPN Public Site API (Fallback)"
+PROVIDER_NONE = "No data"
+
+# Retry policy applied to each Cricinfo commentary page before any fallback is considered.
+CONSUMER_PAGE_ATTEMPTS = 3
+CONSUMER_RETRY_BACKOFF = (2.0, 5.0)
+
 
 # =====================================================================
 # Custom Exceptions for Granular and Safe Error Handling
@@ -646,7 +656,7 @@ class AsyncESPNPublicSiteClient:
                 "shotType": None,
                 "shotControl": None,
                 "shotType_derived": detected_shot,
-                "shotType_source": "Derived (Commentary NLP)" if detected_shot else "None",
+                "shotType_source": "Derived (Commentary NLP)" if detected_shot else None,
                 "timestamp": item.get("date"),
                 "modified": item.get("date"),
                 "batsmanPlayerId": bat_obj.get("athlete", {}).get("id"),
@@ -727,6 +737,7 @@ class AsyncESPNPublicSiteClient:
                 "match_context.id": match_id,
                 "match_context.series_id": series_id,
                 "match_context.inning": item.get("period") or inn_obj.get("number", 1),
+                "data_source": PROVIDER_PUBLIC,
             }
             deliveries.append(rec)
         return deliveries
@@ -787,71 +798,143 @@ class CricketDataProvider:
         res["provider_used"] = "ESPN Public Site API (Fallback)"
         return res
 
+    # ------------------------------------------------------------------
+    # Ball-by-ball commentary: retries first, explicit fallback, provenance
+    # ------------------------------------------------------------------
+    async def _get_consumer_page(
+        self, series_id: int, match_id: int, inning: int, from_over: int
+    ) -> Dict[str, Any]:
+        """
+        Fetch one page of Cricinfo commentary.
+
+        Transient failures (429, 5xx, timeouts, bad JSON) are retried with backoff.
+        A 403 is retried once, because Akamai also answers 403 to short request bursts.
+        If every attempt fails the last error is raised so the caller can decide
+        whether to fall back.
+        """
+        last_exc: Optional[Exception] = None
+        for attempt in range(1, CONSUMER_PAGE_ATTEMPTS + 1):
+            try:
+                return await self.consumer_match_client.get_ball_commentary(
+                    id=match_id, series_id=series_id, inning_number=inning, from_over=from_over
+                )
+            except CricketAPIError as e:
+                last_exc = e
+                max_attempts = 2 if isinstance(e, AccessDeniedError) else CONSUMER_PAGE_ATTEMPTS
+                if attempt >= max_attempts:
+                    break
+                delay = CONSUMER_RETRY_BACKOFF[min(attempt - 1, len(CONSUMER_RETRY_BACKOFF) - 1)]
+                logger.warning(
+                    f"Cricinfo commentary page failed (match {match_id}, inning {inning}, from over {from_over}): "
+                    f"{type(e).__name__}: {e}. Retrying in {delay:.0f}s (attempt {attempt}/{max_attempts})..."
+                )
+                await asyncio.sleep(delay)
+        assert last_exc is not None
+        raise last_exc
+
+    async def _fetch_consumer_commentary(self, series_id: int, match_id: int) -> List[Dict[str, Any]]:
+        """Every inning of a match from the Cricinfo consumer API. Raises CricketAPIError if a page cannot be fetched."""
+        comments: List[Dict[str, Any]] = []
+        for inn in range(1, 5):
+            frm = 1
+            inn_had_comments = False
+            while True:
+                res = await self._get_consumer_page(series_id, match_id, inn, frm)
+                c_list = (res or {}).get("comments") or []
+                if not c_list:
+                    break
+                inn_had_comments = True
+                comments.extend(c_list)
+                nxt = (res or {}).get("nextInningOver")
+                if not nxt or nxt == -1 or nxt <= frm:
+                    break
+                frm = nxt
+                await asyncio.sleep(0.08)
+            if not inn_had_comments and inn >= 2:
+                break
+        return comments
+
+    @staticmethod
+    def _tag_records(records: List[Dict[str, Any]], provider_used: str) -> None:
+        """Stamp every delivery with the feed it came from so exports carry their own provenance."""
+        for rec in records:
+            rec["data_source"] = provider_used
+            if provider_used == PROVIDER_CRICINFO:
+                rec.setdefault("shotType_derived", None)
+                rec["shotType_source"] = "ESPNcricinfo (ball tracking)" if rec.get("shotType") else None
+
+    @staticmethod
+    def _has_tracking(records: List[Dict[str, Any]]) -> bool:
+        return any(rec.get("pitchLine") is not None for rec in records)
+
+    async def get_ball_commentary_with_provenance(
+        self, series_id: int, match_id: int, provider_mode: str = "auto"
+    ) -> Dict[str, Any]:
+        """
+        Ball-by-ball deliveries plus where they came from.
+
+        Returns a dict with keys:
+          comments        - list of delivery dicts (each tagged with data_source)
+          provider_used   - PROVIDER_CRICINFO, PROVIDER_PUBLIC, PROVIDER_PUBLIC_FALLBACK or PROVIDER_NONE
+          fallback_reason - why the public feed was used instead of Cricinfo, or None
+          has_tracking    - True when per-ball wagon / pitch / shot fields are present
+
+        Only Cricinfo carries per-ball tracking. In 'auto' mode Cricinfo is retried on
+        transient errors and the public ESPN feed is used only when Cricinfo cannot be
+        reached; the reason is recorded so the UI can show it instead of failing silently.
+        """
+        result: Dict[str, Any] = {
+            "comments": [],
+            "provider_used": PROVIDER_NONE,
+            "fallback_reason": None,
+            "has_tracking": False,
+        }
+
+        if provider_mode == "public_espn":
+            comments = await self.public_client.get_play_by_play(series_id, match_id)
+            self._tag_records(comments, PROVIDER_PUBLIC)
+            result["comments"] = comments
+            result["provider_used"] = PROVIDER_PUBLIC if comments else PROVIDER_NONE
+            return result
+
+        if provider_mode == "espncricinfo":
+            comments = await self._fetch_consumer_commentary(series_id, match_id)
+            self._tag_records(comments, PROVIDER_CRICINFO)
+            result["comments"] = comments
+            result["provider_used"] = PROVIDER_CRICINFO if comments else PROVIDER_NONE
+            result["has_tracking"] = self._has_tracking(comments)
+            return result
+
+        # Auto: Cricinfo with retries, public ESPN only as a last resort.
+        fallback_reason: Optional[str]
+        try:
+            comments = await self._fetch_consumer_commentary(series_id, match_id)
+            if comments:
+                self._tag_records(comments, PROVIDER_CRICINFO)
+                result["comments"] = comments
+                result["provider_used"] = PROVIDER_CRICINFO
+                result["has_tracking"] = self._has_tracking(comments)
+                return result
+            fallback_reason = "Cricinfo returned no deliveries for this match (not started, or no commentary yet)."
+        except AccessDeniedError as e:
+            fallback_reason = f"Cricinfo refused the request with HTTP 403 even after a retry ({e})."
+        except CricketAPIError as e:
+            fallback_reason = f"Cricinfo request failed after retries: {type(e).__name__}: {e}"
+        logger.warning(f"Match {match_id}: falling back to the public ESPN feed. Reason: {fallback_reason}")
+
+        comments = await self.public_client.get_play_by_play(series_id, match_id)
+        self._tag_records(comments, PROVIDER_PUBLIC_FALLBACK)
+        result["comments"] = comments
+        result["provider_used"] = PROVIDER_PUBLIC_FALLBACK if comments else PROVIDER_NONE
+        result["fallback_reason"] = fallback_reason
+        return result
+
     async def get_ball_commentary(
         self, series_id: int, match_id: int, provider_mode: str = "auto"
     ) -> List[Dict[str, Any]]:
-        """
-        Retrieve ball-by-ball deliveries with provider selection and automatic fallback.
-        """
-        if provider_mode == "public_espn":
-            return await self.public_client.get_play_by_play(series_id, match_id)
-
-        if provider_mode == "espncricinfo":
-            comments = []
-            for inn in range(1, 5):
-                frm = 1
-                inn_had_comments = False
-                while True:
-                    res = await self.consumer_match_client.get_ball_commentary(
-                        id=match_id, series_id=series_id, inning_number=inn, from_over=frm
-                    )
-                    c_list = (res or {}).get("comments") or []
-                    if not c_list:
-                        break
-                    inn_had_comments = True
-                    comments.extend(c_list)
-                    nxt = (res or {}).get("nextInningOver")
-                    if not nxt or nxt == -1 or nxt <= frm:
-                        break
-                    frm = nxt
-                    await asyncio.sleep(0.08)
-                if not inn_had_comments and inn >= 2:
-                    break
-            return comments
-
-        # Auto mode: try Cricinfo Consumer API, fall back to Public ESPN on 403 or error
-        try:
-            comments = []
-            for inn in range(1, 5):
-                frm = 1
-                inn_had_comments = False
-                while True:
-                    res = await self.consumer_match_client.get_ball_commentary(
-                        id=match_id, series_id=series_id, inning_number=inn, from_over=frm
-                    )
-                    c_list = (res or {}).get("comments") or []
-                    if not c_list:
-                        break
-                    inn_had_comments = True
-                    comments.extend(c_list)
-                    nxt = (res or {}).get("nextInningOver")
-                    if not nxt or nxt == -1 or nxt <= frm:
-                        break
-                    frm = nxt
-                    await asyncio.sleep(0.08)
-                if not inn_had_comments and inn >= 2:
-                    break
-            if comments:
-                return comments
-        except AccessDeniedError as e:
-            logger.warning(
-                f"ESPNcricinfo returned HTTP 403 Forbidden for match {match_id} commentary. "
-                "Seamlessly activating authorized fallback provider (ESPN Public Site API)..."
-            )
-        except Exception as e:
-            logger.warning(f"Error fetching commentary from Cricinfo: {e}. Falling back to Public API.")
-
-        return await self.public_client.get_play_by_play(series_id, match_id)
+        """Backward-compatible wrapper returning only the deliveries. See get_ball_commentary_with_provenance."""
+        res = await self.get_ball_commentary_with_provenance(series_id, match_id, provider_mode)
+        return res["comments"]
 
     async def close(self) -> None:
         await self.consumer_series_client.close()

@@ -9,6 +9,10 @@ import pandas as pd
 import streamlit as st
 
 from apis import (
+    PROVIDER_CRICINFO,
+    PROVIDER_NONE,
+    PROVIDER_PUBLIC,
+    PROVIDER_PUBLIC_FALLBACK,
     AccessDeniedError,
     CricketAPIError,
     CricketDataProvider,
@@ -175,13 +179,16 @@ async def fetch_ball_by_ball(
     match_id: int,
     session: aiohttp.ClientSession,
     provider_mode: str = "auto",
-) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any], Dict[str, Any]]:
     """
     Fetch and enrich ball-by-ball deliveries with player names,
     match metadata, clean commentary, and match summary statistics.
+
+    Returns (deliveries, summary, provenance). provenance records which feed
+    served the deliveries, why a fallback happened (if it did), and whether
+    per-ball tracking fields are present.
     """
     from apis import (
-        AccessDeniedError,
         AsyncESPNPublicSiteClient,
         AsyncMatchClient,
     )
@@ -192,6 +199,12 @@ async def fetch_ball_by_ball(
     match_meta: Dict[str, Any] = {}
     player_map: Dict[Any, str] = {}
     summary: Dict[str, Any] = {}
+    provenance: Dict[str, Any] = {
+        "provider_used": PROVIDER_NONE,
+        "fallback_reason": None,
+        "has_tracking": False,
+        "deliveries": 0,
+    }
 
     # Step 1: Collect match metadata & player names
     try:
@@ -208,8 +221,11 @@ async def fetch_ball_by_ball(
                 pl = p.get("player", {})
                 if pl and pl.get("id"):
                     player_map[pl["id"]] = pl.get("longName") or pl.get("name")
-    except AccessDeniedError:
-        pass
+    except Exception as e:
+        # Metadata is a nice-to-have; player names also come from the public summary below.
+        logger.warning(
+            f"Match {match_id}: Cricinfo metadata (commentary/scorecard) unavailable: {type(e).__name__}: {e}"
+        )
 
     # Always fetch summary for roster stats (Wagon Zones, Pitch Map, Preferred Shots)
     try:
@@ -237,8 +253,15 @@ async def fetch_ball_by_ball(
     match_deliveries = []
     try:
         provider = CricketDataProvider(session=session)
-        match_deliveries = await provider.get_ball_commentary(
+        res = await provider.get_ball_commentary_with_provenance(
             series_id=series_id, match_id=match_id, provider_mode=provider_mode
+        )
+        match_deliveries = res["comments"]
+        provenance.update(
+            provider_used=res["provider_used"],
+            fallback_reason=res.get("fallback_reason"),
+            has_tracking=bool(res.get("has_tracking")),
+            deliveries=len(match_deliveries),
         )
         for c in match_deliveries:
             bat_id = c.get("batsmanPlayerId")
@@ -269,8 +292,14 @@ async def fetch_ball_by_ball(
     except Exception as e:
         logger.error(f"Error fetching commentary for match {match_id}: {e}")
         match_deliveries = []
+        provenance.update(
+            provider_used=PROVIDER_NONE,
+            fallback_reason=f"Extraction failed: {type(e).__name__}: {e}",
+            has_tracking=False,
+            deliveries=0,
+        )
 
-    return match_deliveries, summary
+    return match_deliveries, summary, provenance
 
 
 async def batch_extract(
@@ -278,10 +307,11 @@ async def batch_extract(
     match_ids: List[int],
     provider_mode: str = "auto",
     return_summaries: bool = False,
-) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[int, Any]]]:
+) -> Union[List[Dict[str, Any]], Tuple[List[Dict[str, Any]], Dict[int, Any], Dict[int, Dict[str, Any]]]]:
     """
     Batch extract ball commentary deliveries and match summaries across multiple matches.
-    If return_summaries is True, returns (all_deliveries, summaries_dict).
+    If return_summaries is True, returns (all_deliveries, summaries_dict, provenance_dict),
+    where provenance_dict maps match id to the feed that served it and any fallback reason.
     If return_summaries is False (default), returns all_deliveries for backward compatibility.
     """
     async with aiohttp.ClientSession() as session:
@@ -290,26 +320,104 @@ async def batch_extract(
         async def extract_single(mid: int):
             async with sem:
                 try:
-                    deliveries, summary = await fetch_ball_by_ball(series_id, mid, session, provider_mode)
-                    return deliveries, summary, mid
+                    deliveries, summary, provenance = await fetch_ball_by_ball(series_id, mid, session, provider_mode)
+                    return deliveries, summary, provenance, mid
                 except Exception as e:
                     logger.warning(f"Error extracting ball data for match {mid}: {e}")
-                    return [], {}, mid
+                    failed = {
+                        "provider_used": PROVIDER_NONE,
+                        "fallback_reason": f"Extraction failed: {type(e).__name__}: {e}",
+                        "has_tracking": False,
+                        "deliveries": 0,
+                    }
+                    return [], {}, failed, mid
 
         tasks = [extract_single(mid) for mid in match_ids]
         results = await asyncio.gather(*tasks)
 
         all_deliveries = []
         all_summaries = {}
-        for deliveries, summary, mid in results:
+        all_provenance: Dict[int, Dict[str, Any]] = {}
+        for deliveries, summary, provenance, mid in results:
             if isinstance(deliveries, list):
                 all_deliveries.extend(deliveries)
             if summary and isinstance(summary, dict):
                 all_summaries[mid] = summary
+            all_provenance[mid] = provenance
 
         if return_summaries:
-            return all_deliveries, all_summaries
+            return all_deliveries, all_summaries, all_provenance
         return all_deliveries
+
+
+def summarize_ball_sources(
+    provenance: Dict[Any, Dict[str, Any]], fixtures: List[Dict[str, Any]]
+) -> Dict[str, List[Dict[str, Any]]]:
+    """Group extracted matches by the feed that served their ball data."""
+    labels = {f.get("id"): f.get("label", str(f.get("id"))) for f in (fixtures or [])}
+    groups: Dict[str, List[Dict[str, Any]]] = {"cricinfo": [], "fallback": [], "empty": []}
+    for mid, p in (provenance or {}).items():
+        entry = {"id": mid, "label": labels.get(mid, str(mid)), **(p or {})}
+        src = entry.get("provider_used")
+        if src == PROVIDER_CRICINFO:
+            groups["cricinfo"].append(entry)
+        elif src in (PROVIDER_PUBLIC, PROVIDER_PUBLIC_FALLBACK):
+            groups["fallback"].append(entry)
+        else:
+            groups["empty"].append(entry)
+    return groups
+
+
+def render_ball_source_banner(
+    provenance: Dict[Any, Dict[str, Any]],
+    fixtures: List[Dict[str, Any]],
+    tracked_rows: Optional[int] = None,
+    total_rows: Optional[int] = None,
+) -> None:
+    """
+    Say on screen where the ball data came from. Green when every match came from
+    Cricinfo (the only feed with wagon / pitch / shot columns); red, naming each
+    match and the reason, when any match was served by the public ESPN feed.
+    """
+    groups = summarize_ball_sources(provenance, fixtures)
+    n_cric, n_fb, n_empty = len(groups["cricinfo"]), len(groups["fallback"]), len(groups["empty"])
+    if not (n_cric or n_fb or n_empty):
+        return
+
+    if n_fb == 0 and n_cric > 0:
+        detail = ""
+        if tracked_rows is not None and total_rows:
+            detail = (
+                f" Tracking columns (wagonX, wagonY, wagonZone, pitchLine, pitchLength, shotType, shotControl) "
+                f"are populated on {tracked_rows} of {total_rows} deliveries."
+            )
+        st.success(f"Ball data source: **{PROVIDER_CRICINFO}** for all {n_cric} match(es).{detail}")
+    elif n_fb:
+        lines = [
+            f"**{n_fb} of {n_cric + n_fb} match(es) were served by the public ESPN feed, "
+            "which has NO wagon wheel, pitch map or shot columns.**"
+        ]
+        for e in groups["fallback"]:
+            reason = e.get("fallback_reason")
+            if not reason:
+                reason = (
+                    "Public ESPN feed was selected in the Data Provider dropdown."
+                    if e.get("provider_used") == PROVIDER_PUBLIC
+                    else "unknown"
+                )
+            lines.append(f"- {e['label']}: {reason}")
+        lines.append(
+            "Fix: set Data Provider to **Auto** or **ESPNcricinfo Consumer API** and click "
+            "**Download Ball Data** again. If the reason is a 403 or rate limit, wait a minute first."
+        )
+        st.error("\n".join(lines))
+
+    if n_empty:
+        details = []
+        for e in groups["empty"]:
+            reason = e.get("fallback_reason")
+            details.append(f"{e['label']}" + (f" ({reason})" if reason else ""))
+        st.warning("No deliveries were retrieved for: " + "; ".join(details))
 
 
 def main():
@@ -337,20 +445,21 @@ def main():
             provider_choice = st.selectbox(
                 "Data Provider",
                 options=[
-                    "Auto (ESPNcricinfo with Fallback)",
-                    "ESPN Public Site API (Direct 200 OK)",
-                    "ESPNcricinfo Consumer API (Legacy)",
+                    "Auto (ESPNcricinfo; public ESPN only if Cricinfo fails)",
+                    "ESPNcricinfo Consumer API (strict, no fallback)",
+                    "ESPN Public Site API (NO wagon / pitch / shot data)",
                 ],
                 index=0,
                 help=(
-                    "Select the cricket data source. 'Auto' queries ESPNcricinfo and "
-                    "seamlessly switches to the authorized ESPN Public Site API if HTTP 403 Forbidden occurs."
+                    "Only ESPNcricinfo carries per-ball wagon wheel, pitch map and shot columns. "
+                    "'Auto' retries Cricinfo on transient errors and uses the public ESPN feed only when "
+                    "Cricinfo cannot be reached; any fallback is reported on screen after extraction."
                 ),
             )
             mode_map = {
-                "Auto (ESPNcricinfo with Fallback)": "auto",
-                "ESPN Public Site API (Direct 200 OK)": "public_espn",
-                "ESPNcricinfo Consumer API (Legacy)": "espncricinfo",
+                "Auto (ESPNcricinfo; public ESPN only if Cricinfo fails)": "auto",
+                "ESPNcricinfo Consumer API (strict, no fallback)": "espncricinfo",
+                "ESPN Public Site API (NO wagon / pitch / shot data)": "public_espn",
             }
             selected_mode = mode_map[provider_choice]
 
@@ -456,7 +565,7 @@ def main():
             if st.button("Download Ball Data", type="primary", use_container_width=True, disabled=not selected_ids):
                 with st.spinner("Extracting match delivery data & analytical summaries..."):
                     st.session_state["provider_mode"] = selected_mode
-                    raw_deliveries, raw_summaries = run_async(
+                    raw_deliveries, raw_summaries, raw_provenance = run_async(
                         batch_extract(
                             int(st.session_state["s_id"]),
                             selected_ids,
@@ -466,6 +575,7 @@ def main():
                     )
                     st.session_state["raw_data"] = raw_deliveries
                     st.session_state["match_summaries"] = raw_summaries
+                    st.session_state["ball_provenance"] = raw_provenance
                     primary_summary = raw_summaries.get(selected_ids[0]) if (selected_ids and raw_summaries) else {}
                     st.session_state["primary_summary"] = primary_summary
 
@@ -475,6 +585,7 @@ def main():
                     else:
                         st.success(f"Extracted {count_pts} deliveries across {len(selected_ids)} match(es)!")
                         st.toast(f"Extracted {count_pts} deliveries!")
+                    render_ball_source_banner(raw_provenance, st.session_state.get("fixtures", []))
 
         st.divider()
         st.markdown("### Configuration Management")
@@ -523,7 +634,11 @@ def main():
                 st.metric("Total Matches", len(st.session_state["fixtures"]))
                 completed_count = sum(1 for m in st.session_state["fixtures"] if m.get("status") in ("RESULT", "COMPLETED"))
                 st.metric("Completed Matches", completed_count)
-                st.info(f"Data Provider: **{st.session_state.get('provider_used', 'Auto')}**")
+                st.info(f"Fixture list source: **{st.session_state.get('provider_used', 'Auto')}**")
+                if st.session_state.get("ball_provenance"):
+                    render_ball_source_banner(
+                        st.session_state["ball_provenance"], st.session_state.get("fixtures", [])
+                    )
 
         with tab_workspace:
             if "raw_data" in st.session_state and st.session_state["raw_data"]:
@@ -570,14 +685,18 @@ def main():
                         extra_present = [c for c in export_df.columns if c not in CRICINFO_STANDARD_COLUMNS]
                         export_df = export_df[standard_present + extra_present]
 
-                        st.info(
-                            "💡 **Data Provenance Notice: Optical Tracking Columns (`wagonX`, `wagonY`, `pitchLine`, `pitchLength`, `shotControl`)**\n\n"
-                            "• **Optical Tracking Telemetry**: Raw ball-level Hawkeye coordinates are hosted on Cricinfo's internal comments API, which is blocked by Akamai EdgeAuth security (`HTTP 403 Forbidden`).\n"
-                            "• The authorized ESPN live commentary feed provides verified deliveries, runs, wickets, extras, and commentary, but excludes per-ball optical sensor telemetry. To uphold data integrity and avoid data fabrication, these columns remain empty in the raw delivery feed.\n\n"
-                            "👉 **Where to Access Complete Wagon Wheel, Pitch Map & Shot Analytics:**\n"
-                            "1. **Download Excel Workbook (.xlsx)**: Contains dedicated, fully populated sheets: `Wagon_Wheel_Summary` (8 radial zones with runs & scoring shots per batter), `Pitch_Map_Summary` ($6 \\times 5$ length & line grid per bowler), and `Shot_Analytics`.\n"
-                            "2. **Adjacent Tabs**: Switch to **🎯 Wagon Wheel Analytics**, **📐 Pitch Map Distribution**, and **🏏 Shot Classification** right above to inspect the interactive charts and breakdown matrices."
+                        tracked_rows = int(export_df["pitchLine"].notna().sum()) if "pitchLine" in export_df.columns else 0
+                        render_ball_source_banner(
+                            st.session_state.get("ball_provenance", {}),
+                            st.session_state.get("fixtures", []),
+                            tracked_rows=tracked_rows,
+                            total_rows=len(export_df),
                         )
+                        if tracked_rows == 0 and not st.session_state.get("ball_provenance"):
+                            st.warning(
+                                "Tracking columns (wagonX, wagonY, wagonZone, pitchLine, pitchLength, shotType, shotControl) "
+                                "are empty in this dataset. Re-run Download Ball Data with Data Provider set to Auto."
+                            )
 
                         st.markdown(f"#### Complete Dataset Preview ({len(export_df)} deliveries &times; {len(export_df.columns)} columns)")
                         st.dataframe(export_df.head(50), use_container_width=True)
@@ -895,26 +1014,39 @@ def main():
                         "Complete field-by-field verification of retrieved data, genuine sources, non-null counts, "
                         "and technical reasons for unavailable or restricted fields."
                     )
+                    prov_groups = summarize_ball_sources(
+                        st.session_state.get("ball_provenance", {}), st.session_state.get("fixtures", [])
+                    )
+                    if prov_groups["fallback"]:
+                        ball_src = prov_groups["fallback"][0].get("provider_used")
+                        fb_reason = prov_groups["fallback"][0].get("fallback_reason")
+                    elif prov_groups["cricinfo"]:
+                        ball_src, fb_reason = PROVIDER_CRICINFO, None
+                    else:
+                        ball_src, fb_reason = None, None
                     audit_df = build_field_availability_audit(
                         df_flat,
                         primary_summary,
-                        provider_source=st.session_state.get("provider_used", "ESPN Public Site API"),
+                        provider_source=ball_src or st.session_state.get("provider_used", "ESPN Public Site API"),
+                        ball_data_source=ball_src,
+                        fallback_reason=fb_reason,
                     )
 
                     a_c1, a_c2, a_c3, a_c4 = st.columns(4)
                     total_fields = len(audit_df)
                     avail_count = len(audit_df[audit_df["Availability Status"] == "Successfully Extracted"])
                     part_count = len(audit_df[audit_df["Availability Status"] == "Partially Available"])
-                    gated_count = len(audit_df[audit_df["Availability Status"] == "Provider Access Denied"])
+                    gated_statuses = ["Provider Access Denied", "Not Retrieved (Fallback Feed)"]
+                    gated_count = len(audit_df[audit_df["Availability Status"].isin(gated_statuses)])
 
                     a_c1.metric("Audited Fields", total_fields)
                     a_c2.metric("Successfully Extracted", avail_count)
                     a_c3.metric("Partially Available", part_count)
-                    a_c4.metric("Provider Gated (403)", gated_count)
+                    a_c4.metric("Not Retrieved (Fallback Feed)", gated_count)
 
                     filter_choice = st.radio(
                         "Filter Audit View",
-                        options=["All Fields", "Successfully Extracted", "Partially Available", "Provider Restricted (HTTP 403)"],
+                        options=["All Fields", "Successfully Extracted", "Partially Available", "Not Retrieved (Fallback Feed)"],
                         horizontal=True,
                         key="audit_filter_sel",
                     )
@@ -922,8 +1054,8 @@ def main():
                         display_audit = audit_df[audit_df["Availability Status"] == "Successfully Extracted"]
                     elif filter_choice == "Partially Available":
                         display_audit = audit_df[audit_df["Availability Status"] == "Partially Available"]
-                    elif filter_choice == "Provider Restricted (HTTP 403)":
-                        display_audit = audit_df[audit_df["Availability Status"] == "Provider Access Denied"]
+                    elif filter_choice == "Not Retrieved (Fallback Feed)":
+                        display_audit = audit_df[audit_df["Availability Status"].isin(gated_statuses)]
                     else:
                         display_audit = audit_df
 
